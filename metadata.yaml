@@ -116,3 +116,9 @@ requires:
           - port
     versions: [v1]
     __schema_source: https://raw.githubusercontent.com/canonical/operator-schemas/service-mesh-schemas/ingress-auth.yaml
+  kratos-endpoint-info:
+    interface: kratos_endpoints
+    limit: 1
+  hydra-endpoint-info:
+    interface: hydra_endpoints
+    limit: 1

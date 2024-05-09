@@ -15,7 +15,15 @@ from ops.main import main
 from ops.model import ActiveStatus, BlockedStatus, WaitingStatus
 from ops.pebble import Layer
 from serialized_data_interface import NoCompatibleVersions, NoVersionsListed, get_interfaces
-
+from charms.hydra.v0.hydra_endpoints import (
+    HydraEndpointsRelationDataMissingError,
+    HydraEndpointsRelationMissingError,
+    HydraEndpointsRequirer,
+)
+from charms.kratos.v0.kratos_endpoints import (
+    KratosEndpointsRelationDataMissingError,
+    KratosEndpointsRequirer,
+)
 
 class OIDCGatekeeperOperator(CharmBase):
     """Charm OIDC Gatekeeper Operator."""
@@ -29,6 +37,13 @@ class OIDCGatekeeperOperator(CharmBase):
         self._container_name = "oidc-authservice"
         self._container = self.unit.get_container(self._container_name)
         self.pebble_service_name = "oidc-authservice"
+
+        self.kratos_endpoints = KratosEndpointsRequirer(
+            self, relation_name="kratos-endpoint-info"
+        )
+        self.hydra_endpoints = HydraEndpointsRequirer(
+            self, relation_name="hydra-endpoint-info"
+        )
 
         http_service_port = ServicePort(self._http_port, name="http-port")
         self.service_patcher = KubernetesServicePatch(
@@ -50,8 +65,11 @@ class OIDCGatekeeperOperator(CharmBase):
             self.on["ingress-auth"].relation_changed,
             self.on["oidc-client"].relation_changed,
             self.on["client-secret"].relation_changed,
+            self.on["hydra-endpoint-info"].relation_changed,
+            self.on["kratos-endpoint-info"].relation_changed,
         ]:
             self.framework.observe(event, self.main)
+
 
     def main(self, event):
         try:
@@ -74,7 +92,14 @@ class OIDCGatekeeperOperator(CharmBase):
         """Return environment variables based on model configuration."""
         secret_key = self._check_secret()
         skip_urls = self.model.config["skip-auth-urls"] or ""
-        dex_skip_urls = "/dex/" if not skip_urls else "/dex/," + skip_urls
+        auth_urls = ",".join([
+            skip_urls,
+            "/sessions,/self-service/",
+            "/oauth2/,/.well-known/,/userinfo",
+            "/api/consent,/api/device,/api/kratos/self-service,/ui",
+        ])
+        dex_skip_urls = "/dex/" if not skip_urls else "/dex/," + auth_urls
+
 
         ret_env_vars = {
             "AFTER_LOGIN_URL": "/",
@@ -94,6 +119,12 @@ class OIDCGatekeeperOperator(CharmBase):
             # Added to fix https://github.com/canonical/oidc-gatekeeper-operator/issues/64
             "OIDC_STATE_STORE_PATH": "oidc_state.db",
             "SKIP_AUTH_URLS": dex_skip_urls,
+            "PORT": self._http_port,
+          	"LOG_LEVEL": "DEBUG",
+            "TRACING_ENABLED": "false",
+            "DEBUG": "true",
+        	"KRATOS_PUBLIC_URL": self._get_kratos_endpoint_info(),
+	        "HYDRA_ADMIN_URL": self._get_hydra_endpoint_info()
         }
 
         if self.model.config["ca-bundle"]:
@@ -116,12 +147,12 @@ class OIDCGatekeeperOperator(CharmBase):
                 self.pebble_service_name: {
                     "override": "replace",
                     "summary": "oidc-gatekeeper service",
-                    "command": "/home/authservice/oidc-authservice",
+                    "command": "/app serve",
                     "environment": self.service_environment,
                     "startup": "enabled",
                     # See https://github.com/canonical/oidc-gatekeeper-operator/pull/128
                     # for context on why we need working-dir set here.
-                    "working-dir": "/home/authservice",
+                    "working-dir": "/",
                 }
             },
         }
@@ -198,6 +229,28 @@ class OIDCGatekeeperOperator(CharmBase):
         else:
             raise ErrorWithStatus("Waiting for Client Secret", WaitingStatus)
 
+    def _get_kratos_endpoint_info(self) -> str:
+        kratos_public_url = ""
+        if self.model.relations["kratos-endpoint-info"]:
+            try:
+                kratos_endpoints = self.kratos_endpoints.get_kratos_endpoints()
+            except KratosEndpointsRelationDataMissingError:
+                logger.info("No kratos-endpoint-info relation data found")
+            if kratos_endpoints:
+                kratos_public_url = kratos_endpoints["public_endpoint"]
+        return kratos_public_url
+
+    def _get_hydra_endpoint_info(self) -> str:
+        hydra_url = ""
+        if self.model.relations["hydra-endpoint-info"]:
+            try:
+                hydra_endpoints = self.hydra_endpoints.get_hydra_endpoints()
+                hydra_url = hydra_endpoints["admin_endpoint"]
+            except HydraEndpointsRelationDataMissingError:
+                logger.info("No hydra-endpoint-info relation data found")
+            except HydraEndpointsRelationMissingError:
+                logger.info("No hydra-endpoint-info relation found")
+        return hydra_url
 
 def _gen_pass() -> str:
     """Generate a random password."""
